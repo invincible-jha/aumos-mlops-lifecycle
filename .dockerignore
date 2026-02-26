@@ -1,0 +1,49 @@
+# Exclude everything not needed in the Docker image
+
+# Tests and docs
+tests/
+docs/
+*.md
+!README.md
+
+# Dev tooling configs
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Git
+.git/
+.gitignore
+
+# CI/CD
+.github/
+
+# IDE
+.vscode/
+.idea/
+
+# Local environment
+.env
+*.pem
+*.key
+
+# MLflow local artifacts (not part of image)
+mlruns/
+mlflow-artifacts/
+data/
+
+# Helm charts (deployed separately)
+helm/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Docker compose files (not needed inside image)
+docker-compose*.yml
