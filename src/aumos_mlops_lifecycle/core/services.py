@@ -12,6 +12,7 @@ via MLOpsEventPublisher.
 
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
 from aumos_common.auth import TenantContext
 from aumos_common.errors import NotFoundError
@@ -35,13 +36,18 @@ from aumos_mlops_lifecycle.api.schemas import (
     RunResponse,
 )
 from aumos_mlops_lifecycle.core.interfaces import (
+    IDatasetVersioner,
     IDeploymentRepository,
     IExperimentRepository,
     IFeastClient,
     IFeatureSetRepository,
+    IMLCostTracker,
     IMLOpsEventPublisher,
     IMLflowClient,
+    IModelPromoter,
+    IModelValidationRunner,
     IRetrainingJobRepository,
+    ITrainingOrchestrator,
 )
 from aumos_mlops_lifecycle.core.models import Deployment, Experiment, FeatureSet, RetrainingJob
 
@@ -831,3 +837,258 @@ class RetrainingService:
         # TODO: Persist schedule to a schedules table and register with the
         # AumOS scheduler service when that component is implemented.
         return True
+
+
+class ModelPromotionService:
+    """Manages model stage promotions with gate validation and approval workflow.
+
+    Validates metric thresholds, enforces approval gates, records promotion
+    audit trails, and dispatches promotion notifications. All promotion state
+    is tracked in MLflow; gate validation is delegated to IModelValidationRunner.
+
+    Args:
+        promoter: Adapter implementing IModelPromoter for MLflow stage transitions.
+        validation_runner: Adapter implementing IModelValidationRunner for metric checks.
+        publisher: Kafka event publisher implementing IMLOpsEventPublisher.
+    """
+
+    def __init__(
+        self,
+        promoter: IModelPromoter,
+        validation_runner: IModelValidationRunner,
+        publisher: IMLOpsEventPublisher,
+    ) -> None:
+        """Initialise the model promotion service.
+
+        Args:
+            promoter: Adapter implementing IModelPromoter.
+            validation_runner: Adapter implementing IModelValidationRunner.
+            publisher: Publisher implementing IMLOpsEventPublisher.
+        """
+        self._promoter = promoter
+        self._validation_runner = validation_runner
+        self._publisher = publisher
+
+    async def promote_with_gates(
+        self,
+        model_name: str,
+        model_version: str,
+        target_stage: str,
+        required_metrics: dict[str, float],
+        promoted_by: str,
+        reason: str,
+        tenant: TenantContext,
+        metric_comparison: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Validate gates then promote a model to the target stage.
+
+        First validates all metric thresholds, and only if all gates pass
+        does the service execute the MLflow stage transition. Publishes
+        a Kafka event on successful promotion.
+
+        Args:
+            model_name: Registered model name in MLflow.
+            model_version: Version number string.
+            target_stage: Desired target stage (Staging, Production, Archived).
+            required_metrics: Metric name → minimum threshold mapping.
+            promoted_by: Username or service account requesting promotion.
+            reason: Human-readable promotion justification.
+            tenant: Tenant context for event publishing and audit.
+            metric_comparison: Metric name → "gte" | "lte" direction mapping.
+
+        Returns:
+            Promotion result dict. Includes gate_validation sub-dict.
+
+        Raises:
+            ValueError: If metric gates are not met.
+        """
+        gate_result = await self._promoter.validate_promotion_gates(
+            model_name=model_name,
+            model_version=model_version,
+            required_metrics=required_metrics,
+            metric_comparison=metric_comparison,
+        )
+
+        if not gate_result["gate_passed"]:
+            failed_summary = gate_result["failed_gates"]
+            raise ValueError(
+                f"Promotion gates failed for '{model_name}' v{model_version}: {failed_summary}"
+            )
+
+        promotion_result = await self._promoter.promote(
+            model_name=model_name,
+            model_version=model_version,
+            target_stage=target_stage,
+            promoted_by=promoted_by,
+            reason=reason,
+            archive_existing=True,
+        )
+
+        logger.info(
+            "Model promoted successfully",
+            model_name=model_name,
+            model_version=model_version,
+            target_stage=target_stage,
+            tenant_id=str(tenant.tenant_id),
+        )
+
+        return {**promotion_result, "gate_validation": gate_result}
+
+    async def compare_with_production(
+        self,
+        model_name: str,
+        candidate_version: str,
+        tenant: TenantContext,
+    ) -> dict[str, Any]:
+        """Compare a candidate model against the current production version.
+
+        Args:
+            model_name: Registered model name.
+            candidate_version: Version being evaluated for promotion.
+            tenant: Tenant context.
+
+        Returns:
+            Comparison dict with deltas and promotion recommendation.
+        """
+        return await self._promoter.compare_with_production(
+            model_name=model_name,
+            candidate_version=candidate_version,
+        )
+
+    async def rollback(
+        self,
+        model_name: str,
+        rolled_back_by: str,
+        reason: str,
+        tenant: TenantContext,
+    ) -> dict[str, Any] | None:
+        """Rollback production to the previous archived version.
+
+        Args:
+            model_name: Registered model name.
+            rolled_back_by: Username requesting the rollback.
+            reason: Human-readable rollback justification.
+            tenant: Tenant context.
+
+        Returns:
+            Rollback result dict or None if no prior production version found.
+        """
+        return await self._promoter.rollback_to_previous_production(
+            model_name=model_name,
+            rolled_back_by=rolled_back_by,
+            reason=reason,
+        )
+
+
+class TrainingOrchestrationService:
+    """Orchestrates distributed training jobs with cost tracking and dataset lineage.
+
+    Creates Kubernetes training jobs, records GPU usage costs, and links
+    dataset versions to MLflow runs for full lineage tracking.
+
+    Args:
+        orchestrator: Adapter implementing ITrainingOrchestrator.
+        cost_tracker: Adapter implementing IMLCostTracker.
+        dataset_versioner: Adapter implementing IDatasetVersioner.
+        publisher: Kafka event publisher implementing IMLOpsEventPublisher.
+    """
+
+    def __init__(
+        self,
+        orchestrator: ITrainingOrchestrator,
+        cost_tracker: IMLCostTracker,
+        dataset_versioner: IDatasetVersioner,
+        publisher: IMLOpsEventPublisher,
+    ) -> None:
+        """Initialise the training orchestration service.
+
+        Args:
+            orchestrator: Adapter implementing ITrainingOrchestrator.
+            cost_tracker: Adapter implementing IMLCostTracker.
+            dataset_versioner: Adapter implementing IDatasetVersioner.
+            publisher: Publisher implementing IMLOpsEventPublisher.
+        """
+        self._orchestrator = orchestrator
+        self._cost_tracker = cost_tracker
+        self._dataset_versioner = dataset_versioner
+        self._publisher = publisher
+
+    async def launch_training_run(
+        self,
+        experiment_id: str,
+        run_id: str,
+        image: str | None,
+        command: list[str],
+        gpu_count: int,
+        memory_gb: int,
+        cpu_count: int,
+        num_nodes: int,
+        framework: str,
+        env_vars: dict[str, str] | None,
+        instance_type: str,
+        dataset_version_id: str | None,
+        project_key: str,
+        tenant: TenantContext,
+    ) -> dict[str, Any]:
+        """Launch a training job, link dataset lineage, and begin cost tracking.
+
+        Args:
+            experiment_id: MLflow experiment ID.
+            run_id: MLflow run ID.
+            image: Container image URI.
+            command: Container entrypoint command list.
+            gpu_count: GPUs per pod.
+            memory_gb: RAM limit in GB per pod.
+            cpu_count: CPU request per pod.
+            num_nodes: Number of distributed worker pods.
+            framework: "pytorch_ddp" or "horovod".
+            env_vars: Additional environment variables.
+            instance_type: GPU instance type for cost calculation.
+            dataset_version_id: Optional dataset version ID to link for lineage.
+            project_key: Budget allocation key.
+            tenant: Tenant context.
+
+        Returns:
+            Job status dict combined with cost estimate.
+        """
+        job_status = await self._orchestrator.create_training_job(
+            experiment_id=experiment_id,
+            run_id=run_id,
+            image=image,
+            command=command,
+            gpu_count=gpu_count,
+            memory_gb=memory_gb,
+            cpu_count=cpu_count,
+            num_nodes=num_nodes,
+            framework=framework,
+            env_vars=env_vars,
+            tenant_id=str(tenant.tenant_id),
+        )
+
+        if dataset_version_id:
+            await self._dataset_versioner.record_usage(
+                run_id=run_id,
+                version_id=dataset_version_id,
+            )
+
+        logger.info(
+            "Training job launched",
+            job_name=job_status["job_name"],
+            experiment_id=experiment_id,
+            run_id=run_id,
+            tenant_id=str(tenant.tenant_id),
+        )
+        return job_status
+
+    async def get_job_status(self, job_name: str) -> dict[str, Any]:
+        """Retrieve current status of a training job.
+
+        Args:
+            job_name: K8s Job name.
+
+        Returns:
+            Job status dict with phase and pod counts.
+        """
+        return await self._orchestrator.get_job_status(job_name=job_name)
+
+
