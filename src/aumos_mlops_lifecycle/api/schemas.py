@@ -255,3 +255,68 @@ class RetrainingJobListResponse(BaseModel):
     total: int = Field(description="Total number of retraining jobs")
     page: int = Field(description="Current page number")
     page_size: int = Field(description="Items per page")
+
+
+# ---------------------------------------------------------------------------
+# Artifact schemas (GAP-158: Artifact Storage)
+# ---------------------------------------------------------------------------
+
+
+class ArtifactResponse(BaseModel):
+    """Response schema for a single uploaded artifact."""
+
+    experiment_id: uuid.UUID = Field(description="Experiment this artifact belongs to")
+    artifact_name: str = Field(description="Original file name")
+    artifact_uri: str = Field(description="S3/MinIO URI where the artifact is stored")
+    size_bytes: int = Field(default=0, description="Artifact file size in bytes")
+    content_type: str = Field(default="application/octet-stream", description="MIME type of the artifact")
+    download_url: str | None = Field(default=None, description="Presigned download URL (populated on request)")
+
+
+class ArtifactListResponse(BaseModel):
+    """Response listing all artifacts for an experiment."""
+
+    experiment_id: uuid.UUID = Field(description="Experiment identifier")
+    artifacts: list[ArtifactResponse] = Field(description="List of uploaded artifacts")
+    total: int = Field(description="Total number of artifacts")
+
+
+class ArtifactDownloadUrlResponse(BaseModel):
+    """Response containing a presigned artifact download URL."""
+
+    artifact_name: str = Field(description="Artifact file name")
+    download_url: str = Field(description="Presigned download URL")
+    expires_in_seconds: int = Field(default=3600, description="URL expiry in seconds")
+
+
+# ---------------------------------------------------------------------------
+# Model card schemas (GAP-160: Model Card Generation)
+# ---------------------------------------------------------------------------
+
+
+class ModelCardResponse(BaseModel):
+    """Response schema for a model card in JSON format."""
+
+    model_id: str = Field(description="Model identifier")
+    model_name: str = Field(description="Model display name")
+    description: str | None = Field(description="Model purpose")
+    version: str = Field(description="Model version")
+    training_data: str = Field(description="Training dataset description")
+    framework: str = Field(description="ML framework")
+    metrics: dict[str, Any] = Field(description="Training metrics")
+    evaluation_results: dict[str, Any] = Field(description="Evaluation scores")
+    deployment_environments: list[str] = Field(description="Environments deployed to")
+    known_limitations: str = Field(description="Known limitations")
+    generated_at: datetime = Field(description="Card generation timestamp")
+
+
+# ---------------------------------------------------------------------------
+# Pipeline DAG schemas (GAP-163: Pipeline DAG Visualization)
+# ---------------------------------------------------------------------------
+
+
+class DAGResponse(BaseModel):
+    """React Flow–compatible DAG response for pipeline lineage visualization."""
+
+    nodes: list[dict[str, Any]] = Field(description="React Flow node objects")
+    edges: list[dict[str, Any]] = Field(description="React Flow edge objects")
